@@ -39,6 +39,12 @@ var (
 	selectFoo_  = api.NewESFromLabels(labels.ParseSelectLabel("foo"))
 	allowFooL3_ = selectFoo_
 
+	// Identity, labels, selectors for an endpoint named "bar"
+	identityBar = uint32(100)
+	labelsBar   = labels.ParseSelectLabelArray("bar", "blue")
+	selectBar_  = api.NewESFromLabels(labels.ParseSelectLabel("bar"))
+	allowBarL3_ = selectBar_
+
 	// API rule sections for composability
 	// L4 rule sections
 	allowAllL4_ []api.PortRule
@@ -82,12 +88,23 @@ var (
 			ToPorts: combineL4L7(allowPort80, allowHTTPRoot),
 		}})
 
+	rule__L3AllowFoo = api.NewRule().
+				WithIngressRules([]api.IngressRule{{
+			FromEndpoints: []api.EndpointSelector{allowFooL3_},
+		}})
+
+	rule__L3AllowBar = api.NewRule().
+				WithIngressRules([]api.IngressRule{{
+			FromEndpoints: []api.EndpointSelector{allowBarL3_},
+		}})
+
 	// Misc other bpf key fields for convenience / readability.
 	l7RedirectNone_ = uint16(0)
 	l7RedirectProxy = uint16(1)
 	dirIngress      = trafficdirection.Ingress.Uint8()
 	// Desired map keys for L3, L3-dependent L4, L4
 	mapKeyAllowFoo__ = Key{identityFoo, 0, 0, dirIngress}
+	mapKeyAllowBar__ = Key{identityBar, 0, 0, dirIngress}
 	mapKeyAllowFooL4 = Key{identityFoo, 80, 6, dirIngress}
 	mapKeyAllow___L4 = Key{0, 80, 6, dirIngress}
 	// Desired map entries for no L7 redirect / redirect to Proxy
@@ -232,6 +249,44 @@ func (d *policyDistillery) distillPolicy(epLabels labels.LabelArray) (MapState, 
 	}
 
 	return result, nil
+}
+
+func Test_MergeL3(t *testing.T) {
+	identityCache := cache.IdentityCache{
+		identity.NumericIdentity(identityFoo): labelsFoo,
+		identity.NumericIdentity(identityBar): labelsBar,
+	}
+
+	tests := []struct {
+		test   int
+		rules  api.Rules
+		result MapState
+	}{
+		{0, api.Rules{rule__L3AllowFoo, rule__L3AllowBar}, MapState{mapKeyAllowFoo__: mapEntryL7None_, mapKeyAllowBar__: mapEntryL7None_}},
+	}
+
+	for _, tt := range tests {
+		repo := newPolicyDistillery(identityCache)
+		for _, r := range tt.rules {
+			if r != nil {
+				rule := r.WithEndpointSelector(selectFoo_)
+				_, _ = repo.AddList(api.Rules{rule})
+			}
+		}
+		t.Run(fmt.Sprintf("permutation_%d", tt.test), func(t *testing.T) {
+			logBuffer := new(bytes.Buffer)
+			repo = repo.WithLogBuffer(logBuffer)
+			mapstate, err := repo.distillPolicy(labelsFoo)
+			if err != nil {
+				t.Errorf("Policy resolution failure: %s", err)
+			}
+			if equal, err := checker.DeepEqual(mapstate, tt.result); !equal {
+				t.Logf("Rules:\n%s\n\n", tt.rules.String())
+				t.Logf("Policy Trace: \n%s\n", logBuffer.String())
+				t.Errorf("Policy obtained didn't match expected for endpoint %s:\n%s", labelsFoo, err)
+			}
+		})
+	}
 }
 
 func Test_MergeRules(t *testing.T) {
